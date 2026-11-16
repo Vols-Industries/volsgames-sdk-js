@@ -8,13 +8,53 @@ export interface RoomSpec {
   reconnect_grace_ms?: number
   empty_ttl_ms?: number
   flush_on_tick?: boolean
+  max_state_bytes?: number
 }
 
 export interface RoomView extends Required<RoomSpec> {
   room: string
   players: number
   created_ms: number
+  locked: boolean
   node?: string
+}
+
+export interface PlayerView {
+  id: number
+  player: string
+  name: string
+  connected: boolean
+}
+
+export interface PlayersView {
+  host: number | null
+  players: PlayerView[]
+}
+
+export interface StateEntry {
+  scope: number
+  key: string
+  value: Uint8Array
+  rev: number
+  by: number
+}
+
+export interface StateView {
+  rev: number
+  entries: StateEntry[]
+}
+
+export interface StateWrite {
+  key: string
+  value: Uint8Array | string | null
+  player?: string
+  expect?: number
+}
+
+export interface Written {
+  scope: number
+  key: string
+  rev: number
 }
 
 export interface PlayerSpec {
@@ -34,6 +74,18 @@ export interface NodeView {
   up: boolean
   rooms: number
   players: number
+}
+
+const utf8 = new TextEncoder()
+
+function toBase64(b: Uint8Array) {
+  let s = ''
+  for (const x of b) s += String.fromCharCode(x)
+  return btoa(s)
+}
+
+function fromBase64(s: string) {
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
 }
 
 export class ControlError extends Error {
@@ -86,6 +138,28 @@ export class Control {
 
   async closeRoom(id: string) {
     await this.call<void>('DELETE', `/v1/rooms/${encodeURIComponent(id)}`)
+  }
+
+  lock(id: string, locked = true) {
+    return this.call<RoomView>('PATCH', `/v1/rooms/${encodeURIComponent(id)}`, { locked })
+  }
+
+  players(room: string) {
+    return this.call<PlayersView>('GET', `/v1/rooms/${encodeURIComponent(room)}/players`)
+  }
+
+  async kick(room: string, player: string) {
+    await this.call<void>('DELETE', `/v1/rooms/${encodeURIComponent(room)}/players/${encodeURIComponent(player)}`)
+  }
+
+  async state(room: string): Promise<StateView> {
+    const v = await this.call<{ rev: number; entries: (Omit<StateEntry, 'value'> & { value: string })[] }>('GET', `/v1/rooms/${encodeURIComponent(room)}/state`)
+    return { rev: v.rev, entries: v.entries.map((e) => ({ ...e, value: fromBase64(e.value) })) }
+  }
+
+  setState(room: string, { key, value, player, expect }: StateWrite) {
+    const bytes = typeof value === 'string' ? utf8.encode(value) : value
+    return this.call<Written>('POST', `/v1/rooms/${encodeURIComponent(room)}/state`, { key, value: bytes && toBase64(bytes), player, expect })
   }
 
   token(room: string, spec: PlayerSpec) {

@@ -27,6 +27,9 @@ test('client messages match the Rust encoder byte for byte', () => {
     ['subscribe', { kind: 'subscribe', group: 9 }],
     ['unsubscribe', { kind: 'unsubscribe', group: 9 }],
     ['leave', { kind: 'leave' }],
+    ['set', { kind: 'set', scope: 0, key: 'phase', value: new TextEncoder().encode('lobby') }],
+    ['set_mine', { kind: 'set', scope: 3, key: 'ready', value: new TextEncoder().encode('1'), expect: 0 }],
+    ['set_delete', { kind: 'set', scope: 0, key: 'flag', value: null, expect: 1234567890123 }],
   ]
   for (const [name, m] of cases) assert.equal(hex(encodeClient(m)), hex(g(`c ${name}`)), name)
 })
@@ -43,6 +46,22 @@ test('server messages from the Rust encoder decode', () => {
       [1, 'ann'],
       [3, 'Eric'],
     ],
+    host: 1,
+    entries: 0,
+  })
+  assert.deepEqual(decodeServer(body('s welcome_state')), {
+    kind: 'welcome',
+    player: 3,
+    room: 'eu-1',
+    tickRate: 60,
+    serverTime: 1793549111000,
+    reconnected: false,
+    players: [
+      [1, 'ann'],
+      [3, 'Eric'],
+    ],
+    host: 1,
+    entries: 2,
   })
   assert.deepEqual(decodeServer(body('s joined')), { kind: 'joined', player: 2, name: 'bob' })
   assert.deepEqual(decodeServer(body('s left')), { kind: 'left', player: 2, reason: reason.timeout })
@@ -50,6 +69,12 @@ test('server messages from the Rust encoder decode', () => {
   assert.deepEqual(decodeServer(body('s pong')), { kind: 'pong', clientTime: 1234567890123, serverTime: 1793549111000 })
   assert.deepEqual(decodeServer(body('s error')), { kind: 'error', code: code.full, message: 'full' })
   assert.deepEqual(decodeServer(body('s bye')), { kind: 'bye', reason: reason.replaced })
+  const enc = new TextEncoder()
+  assert.deepEqual(decodeServer(body('s state')), { kind: 'state', scope: 0, key: 'phase', rev: 7, by: 1, value: enc.encode('play') })
+  assert.deepEqual(decodeServer(body('s state_mine')), { kind: 'state', scope: 3, key: 'ready', rev: 8, by: 3, value: enc.encode('1') })
+  assert.deepEqual(decodeServer(body('s state_delete')), { kind: 'state', scope: 0, key: 'phase', rev: 9, by: 0, value: null })
+  assert.deepEqual(decodeServer(body('s refused')), { kind: 'refused', scope: 0, key: 'flag', code: code.conflict })
+  assert.deepEqual(decodeServer(body('s host')), { kind: 'host', player: 1 })
 })
 
 test('malformed server messages throw', () => {
@@ -61,6 +86,8 @@ test('malformed server messages throw', () => {
     new Uint8Array([0x81, 1]),
     new Uint8Array([0x82, 2, 0, 0, 0, 2, 0xff, 0xfe]),
     new Uint8Array([0x84, 2, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    body('s state_delete').map((b, i, a) => (i === a.length - 1 ? 2 : b)),
+    body('s host').subarray(0, 3),
   ]
   for (const b of bad) assert.throws(() => decodeServer(b), ProtocolError, hex(b))
 })

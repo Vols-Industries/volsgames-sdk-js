@@ -1,5 +1,19 @@
 import { type Kind, type Link, type Sink, webSocket, webTransport } from './link.ts'
-import { type ServerMessage, type Target, code, concat, decodeServer, encodeClient, frame, pack, parseDatagram, reason, seqNewer } from './proto.ts'
+import {
+  MAX_KEY,
+  MAX_VALUE,
+  type ServerMessage,
+  type Target,
+  code,
+  concat,
+  decodeServer,
+  encodeClient,
+  frame,
+  pack,
+  parseDatagram,
+  reason,
+  seqNewer,
+} from './proto.ts'
 
 export interface Endpoints {
   quic?: string
@@ -29,6 +43,17 @@ export interface SendOptions {
   reliable?: boolean
 }
 
+export interface SetOptions {
+  mine?: boolean
+  expect?: number
+}
+
+export interface Entry {
+  value: Uint8Array
+  rev: number
+  by: number
+}
+
 export interface Closed {
   reason?: number
   code?: number
@@ -39,10 +64,16 @@ export interface Events {
   data: [from: number, payload: Uint8Array]
   joined: [player: number, name: string]
   left: [player: number, reason: number]
+  state: [key: string, entry: Entry | undefined, player: number]
+  host: [player: number]
   reconnecting: []
   reconnected: []
   close: [closed: Closed]
 }
+
+type Store = Map<number, Map<string, Entry>>
+type Welcome = Extract<ServerMessage, { kind: 'welcome' }>
+type Write = { resolve: (e: Entry | undefined) => void; reject: (e: unknown) => void }
 
 export class VolsError extends Error {
   readonly code: number
@@ -52,7 +83,25 @@ export class VolsError extends Error {
   }
 }
 
-const fatal = new Set<number>([code.badToken, code.noRoom, code.full, code.wrongGame])
+const fatal = new Set<number>([code.badToken, code.noRoom, code.full, code.wrongGame, code.forbidden, code.locked])
+const refusals: Record<number, string> = {
+  [code.conflict]: 'the entry changed since the expected revision',
+  [code.forbidden]: 'this entry is not yours to change',
+  [code.tooLarge]: 'key over 64 bytes, value over 8192 bytes or room state full',
+  [code.protocol]: 'key must not be empty',
+}
+const none: ReadonlyMap<string, Entry> = new Map()
+
+function put(store: Store, scope: number, key: string, e: Entry | undefined) {
+  let keys = store.get(scope)
+  if (!e) {
+    keys?.delete(key)
+    if (keys && !keys.size) store.delete(scope)
+    return
+  }
+  if (!keys) store.set(scope, (keys = new Map()))
+  keys.set(key, e)
+}
 const utf8 = new TextEncoder()
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -100,12 +149,13 @@ export class Room {
   player = 0
   room = ''
   tickRate = 0
+  host = 0
   transport: Kind = 'websocket'
   readonly players = new Map<number, string>()
 
   private readonly source: GrantSource
   private readonly options: Options
-  private state: 'opening' | 'open' | 'reconnecting' | 'closed' = 'opening'
+  private status: 'opening' | 'open' | 'reconnecting' | 'closed' = 'opening'
   private link?: Link
   private gen = 0
   private seq = 0
@@ -116,6 +166,10 @@ export class Room {
   private bye?: Closed
   private closed?: Closed
   private welcome?: { resolve: () => void; reject: (e: unknown) => void }
+  private sync?: { m: Welcome; left: number; fresh: Store }
+  private entries: Store = new Map()
+  private writes: Write[] = []
+  private inflight = 0
   private reliableQueue: Uint8Array[] = []
   private unreliableQueue: Uint8Array[] = []
   private scheduled = false
@@ -154,6 +208,22 @@ export class Room {
     this.queue(encodeClient({ kind: 'unsubscribe', group }), true)
   }
 
+  state(player = 0): ReadonlyMap<string, Entry> {
+    return this.entries.get(player) ?? none
+  }
+
+  set(key: string, value: Uint8Array | string | null, { mine = false, expect }: SetOptions = {}): Promise<Entry | undefined> {
+    const bytes = typeof value === 'string' ? utf8.encode(value) : value
+    const size = utf8.encode(key).length
+    if (!size) return Promise.reject(new VolsError(code.protocol, refusals[code.protocol]))
+    if (size > MAX_KEY || (bytes && bytes.length > MAX_VALUE)) return Promise.reject(new VolsError(code.tooLarge, refusals[code.tooLarge]))
+    if (this.status === 'closed') return Promise.reject(new Error('room closed'))
+    return new Promise((resolve, reject) => {
+      this.writes.push({ resolve, reject })
+      this.queue(encodeClient({ kind: 'set', scope: mine ? this.player : 0, key, value: bytes, expect }), true)
+    })
+  }
+
   ping(timeoutMs = 3000): Promise<number> {
     const clientTime = (this.lastPing = Math.max(Math.round(performance.now() * 1000), this.lastPing + 1))
     return new Promise((resolve, reject) => {
@@ -178,7 +248,7 @@ export class Room {
       if (this.closed) return resolve(this.closed)
       this.on('close', resolve)
       this.leaving = true
-      if (this.state !== 'open') return this.finish({ reason: reason.left })
+      if (this.status !== 'open') return this.finish({ reason: reason.left })
       this.queue(encodeClient({ kind: 'leave' }), true)
       const t = setTimeout(() => this.finish({ reason: reason.left }), 2000)
       this.on('close', () => clearTimeout(t))
@@ -208,6 +278,7 @@ export class Room {
     this.link = link
     this.transport = link.kind
     this.lastSeq = -1
+    this.sync = undefined
     const welcomed = new Promise<void>((resolve, reject) => (this.welcome = { resolve, reject }))
     link.reliable(encodeClient({ kind: 'hello', token: grant.token }))
     try {
@@ -220,7 +291,7 @@ export class Room {
   }
 
   private queue(rec: Uint8Array, reliable: boolean) {
-    if (this.state === 'closed' || (!reliable && this.state !== 'open')) return
+    if (this.status === 'closed' || (!reliable && this.status !== 'open')) return
     ;(reliable ? this.reliableQueue : this.unreliableQueue).push(rec)
     if (this.scheduled) return
     this.scheduled = true
@@ -230,12 +301,13 @@ export class Room {
   private flush() {
     this.scheduled = false
     const link = this.link
-    if (!link || this.state !== 'open') return
+    if (!link || this.status !== 'open') return
     const { batches, oversize } = pack(this.unreliableQueue, link.maxDatagram - 2)
     const reliable = this.reliableQueue.concat(oversize)
     this.unreliableQueue = []
     this.reliableQueue = []
     if (reliable.length) link.reliable(concat(reliable))
+    this.inflight = this.writes.length
     for (const b of batches) {
       this.seq = (this.seq + 1) & 0xffff
       link.unreliable(frame(this.seq, b))
@@ -262,12 +334,26 @@ export class Room {
     }
     switch (m.kind) {
       case 'welcome':
-        return this.onWelcome(m)
+        if (!m.entries) return this.onWelcome(m, new Map())
+        this.sync = { m, left: m.entries, fresh: new Map() }
+        return
+      case 'state':
+        return this.onState(m)
+      case 'refused': {
+        if (!this.inflight) return
+        this.inflight--
+        this.writes.shift()?.reject(new VolsError(m.code, refusals[m.code] ?? 'refused'))
+        return
+      }
+      case 'host':
+        this.host = m.player
+        return this.emit('host', m.player)
       case 'joined':
         this.players.set(m.player, m.name)
         return this.emit('joined', m.player, m.name)
       case 'left':
         this.players.delete(m.player)
+        this.entries.delete(m.player)
         return this.emit('left', m.player, m.reason)
       case 'data':
         return this.emit('data', m.from, m.payload)
@@ -290,20 +376,42 @@ export class Room {
     }
   }
 
-  private onWelcome(m: Extract<ServerMessage, { kind: 'welcome' }>) {
+  private onState(m: Extract<ServerMessage, { kind: 'state' }>) {
+    const e = m.value ? { value: m.value.slice(), rev: m.rev, by: m.by } : undefined
+    if (this.sync) {
+      put(this.sync.fresh, m.scope, m.key, e)
+      if (!--this.sync.left) this.onWelcome(this.sync.m, this.sync.fresh)
+      return
+    }
+    put(this.entries, m.scope, m.key, e)
+    this.emit('state', m.key, e, m.scope)
+    if (m.by !== this.player || !this.inflight) return
+    this.inflight--
+    this.writes.shift()?.resolve(e)
+  }
+
+  private onWelcome(m: Welcome, fresh: Store) {
     const before = new Map(this.players)
-    const again = this.state === 'reconnecting'
+    const old = this.entries
+    const host = this.host
+    const again = this.status === 'reconnecting'
+    this.sync = undefined
     this.player = m.player
     this.room = m.room
     this.tickRate = m.tickRate
+    this.host = m.host
+    this.entries = fresh
     this.offset = m.serverTime - Date.now()
     this.players.clear()
     for (const [id, name] of m.players) this.players.set(id, name)
-    this.state = 'open'
+    this.status = 'open'
     this.bye = undefined
     if (again) {
       for (const id of before.keys()) if (!this.players.has(id)) this.emit('left', id, reason.timeout)
       for (const [id, name] of this.players) if (!before.has(id)) this.emit('joined', id, name)
+      for (const [scope, keys] of old) for (const key of keys.keys()) if (!fresh.get(scope)?.has(key)) this.emit('state', key, undefined, scope)
+      for (const [scope, keys] of fresh) for (const [key, e] of keys) if (old.get(scope)?.get(key)?.rev !== e.rev) this.emit('state', key, e, scope)
+      if (host !== this.host) this.emit('host', this.host)
     }
     this.welcome?.resolve()
     this.welcome = undefined
@@ -312,18 +420,22 @@ export class Room {
 
   private onClosed() {
     this.link = undefined
+    this.sync = undefined
+    const lost = this.writes.splice(0, this.inflight)
+    this.inflight = 0
+    for (const w of lost) w.reject(new Error('connection lost before the write was confirmed'))
     if (this.welcome) {
       this.welcome.reject(this.bye?.code ? new VolsError(this.bye.code, this.bye.message ?? '') : new Error('connection closed'))
       this.welcome = undefined
       return
     }
-    if (this.state !== 'open') return
+    if (this.status !== 'open') return
     if (this.bye || this.leaving) return this.finish(this.bye ?? { reason: reason.left })
     void this.recover()
   }
 
   private async recover() {
-    this.state = 'reconnecting'
+    this.status = 'reconnecting'
     this.emit('reconnecting')
     const until = Date.now() + (this.options.reconnectMs ?? 20_000)
     for (let wait = 100; Date.now() + wait < until; wait = Math.min(wait * 2, 2000)) {
@@ -348,14 +460,18 @@ export class Room {
   }
 
   private finish(c: Closed) {
-    if (this.state === 'closed') return
-    this.state = 'closed'
+    if (this.status === 'closed') return
+    this.status = 'closed'
     this.closed = c
     this.gen++
     this.link?.close()
     this.link = undefined
     this.reliableQueue = []
     this.unreliableQueue = []
+    const writes = this.writes
+    this.writes = []
+    this.inflight = 0
+    for (const w of writes) w.reject(new Error('room closed'))
     this.emit('close', c)
   }
 }

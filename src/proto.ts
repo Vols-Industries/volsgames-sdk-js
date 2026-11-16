@@ -1,8 +1,22 @@
 export const VERSION = 0
 export const DATAGRAM_BUDGET = 1150
+export const MAX_KEY = 64
+export const MAX_VALUE = 8192
 
 export const reason = { left: 0, timeout: 1, kicked: 2, roomClosed: 3, replaced: 4, slow: 5, limit: 6 } as const
-export const code = { badToken: 1, expired: 2, noRoom: 3, full: 4, protocol: 5, helloTimeout: 6, wrongGame: 7 } as const
+export const code = {
+  badToken: 1,
+  expired: 2,
+  noRoom: 3,
+  full: 4,
+  protocol: 5,
+  helloTimeout: 6,
+  wrongGame: 7,
+  conflict: 8,
+  forbidden: 9,
+  tooLarge: 10,
+  locked: 11,
+} as const
 
 export type Target = 'all' | 'others' | { player: number } | { group: number }
 
@@ -13,15 +27,29 @@ export type ClientMessage =
   | { kind: 'subscribe'; group: number }
   | { kind: 'unsubscribe'; group: number }
   | { kind: 'leave' }
+  | { kind: 'set'; scope: number; key: string; value: Uint8Array | null; expect?: number }
 
 export type ServerMessage =
-  | { kind: 'welcome'; player: number; room: string; tickRate: number; serverTime: number; reconnected: boolean; players: [number, string][] }
+  | {
+      kind: 'welcome'
+      player: number
+      room: string
+      tickRate: number
+      serverTime: number
+      reconnected: boolean
+      players: [number, string][]
+      host: number
+      entries: number
+    }
   | { kind: 'joined'; player: number; name: string }
   | { kind: 'left'; player: number; reason: number }
   | { kind: 'data'; from: number; payload: Uint8Array }
   | { kind: 'pong'; clientTime: number; serverTime: number }
   | { kind: 'error'; code: number; message: string }
   | { kind: 'bye'; reason: number }
+  | { kind: 'state'; scope: number; key: string; rev: number; by: number; value: Uint8Array | null }
+  | { kind: 'refused'; scope: number; key: string; code: number }
+  | { kind: 'host'; player: number }
 
 export class ProtocolError extends Error {}
 
@@ -175,6 +203,14 @@ export function encodeClient(m: ClientMessage): Uint8Array {
     case 'leave':
       w.u8(6)
       break
+    case 'set':
+      w.u8(7)
+      w.u32(m.scope)
+      w.bytes(utf8.encode(m.key))
+      w.u8((m.value ? 1 : 0) | (m.expect === undefined ? 0 : 2))
+      if (m.expect !== undefined) w.u64(m.expect)
+      if (m.value) w.bytes(m.value)
+      break
   }
   return w.record()
 }
@@ -194,7 +230,7 @@ export function decodeServer(body: Uint8Array): ServerMessage {
       if (n > 65_536) throw new ProtocolError('too many players')
       const players: [number, string][] = []
       for (let i = 0; i < n; i++) players.push([r.u32(), r.str()])
-      m = { kind: 'welcome', player, room, tickRate, serverTime, reconnected, players }
+      m = { kind: 'welcome', player, room, tickRate, serverTime, reconnected, players, host: r.u32(), entries: r.varint() }
       break
     }
     case 0x82:
@@ -214,6 +250,22 @@ export function decodeServer(body: Uint8Array): ServerMessage {
       break
     case 0x87:
       m = { kind: 'bye', reason: r.u8() }
+      break
+    case 0x88: {
+      const scope = r.u32()
+      const key = r.str()
+      const rev = r.u64()
+      const by = r.u32()
+      const has = r.u8()
+      if (has > 1) throw new ProtocolError('flag')
+      m = { kind: 'state', scope, key, rev, by, value: has ? r.bytes() : null }
+      break
+    }
+    case 0x89:
+      m = { kind: 'refused', scope: r.u32(), key: r.str(), code: r.u16() }
+      break
+    case 0x8a:
+      m = { kind: 'host', player: r.u32() }
       break
     default:
       throw new ProtocolError('unknown kind')

@@ -80,6 +80,7 @@ test('hello first, welcome fills the room, events flow, stale datagrams drop', a
   assert.equal(room.player, 3)
   assert.equal(room.room, 'eu-1')
   assert.equal(room.tickRate, 60)
+  assert.equal(room.host, 1)
   assert.equal(room.transport, 'websocket')
   assert.deepEqual([...room.players], [
     [1, 'ann'],
@@ -227,4 +228,83 @@ test('a grant function that throws during reconnect ends the room with its messa
   s.close()
   assert.deepEqual(await closed, { message: 'backend said no' })
   assert.equal(FakeSocket.sockets.length, 1)
+})
+
+const text = (e: { value: Uint8Array } | undefined) => e && new TextDecoder().decode(e.value)
+const withHost = (host: number) => g('s welcome').map((b, i, a) => (i === a.length - 5 ? host : b))
+
+async function withState(source: Grant | (() => Promise<Grant>) = grant): Promise<[Room, FakeSocket]> {
+  FakeSocket.sockets = []
+  FakeSocket.refuse = false
+  let done = false
+  const p = connect(source, opts).then((r) => ((done = true), r))
+  await until(() => FakeSocket.sockets[0]?.sent.length === 1)
+  const s = FakeSocket.sockets[0]
+  s.serve(0, g('s welcome_state'))
+  s.serve(0, g('s state'))
+  await tick()
+  assert.equal(done, false)
+  s.serve(0, g('s state_mine'))
+  return [await p, s]
+}
+
+test('connect waits for the state after the welcome, writes resolve or reject in order', async () => {
+  const [room, s] = await withState()
+  assert.equal(text(room.state().get('phase')), 'play')
+  assert.deepEqual({ ...room.state(3).get('ready'), value: undefined }, { value: undefined, rev: 8, by: 3 })
+  assert.equal(room.state(2).size, 0)
+  const events: string[] = []
+  room.on('state', (k, e, p) => events.push(`${p} ${k} ${text(e)}`))
+  room.on('host', (p) => events.push(`host ${p}`))
+  const refused = room.set('flag', 'x')
+  const mine = room.set('ready', '1', { mine: true, expect: 0 })
+  await tick()
+  assert.equal(hex(s.sent[1]), lane0(new Uint8Array([...encodeClient({ kind: 'set', scope: 0, key: 'flag', value: new TextEncoder().encode('x') }), ...g('c set_mine')])))
+  s.serve(0, g('s refused'))
+  await assert.rejects(refused, (e) => e instanceof VolsError && e.code === 8)
+  s.serve(0, g('s state_mine'))
+  assert.deepEqual(text(await mine), '1')
+  const lost = room.set('later', new Uint8Array([1]))
+  await tick()
+  s.serve(0, g('s state'))
+  s.serve(0, g('s state_delete'))
+  s.serve(0, g('s host'))
+  assert.equal(room.state().has('phase'), false)
+  assert.equal(room.host, 1)
+  assert.deepEqual(events, ['3 ready 1', '0 phase play', '0 phase undefined', 'host 1'])
+  s.close()
+  await assert.rejects(lost, /connection lost/)
+  const unsent = room.set('p', 'q')
+  assert.deepEqual(await room.leave(), { reason: reason.left })
+  await assert.rejects(unsent, /room closed/)
+  await assert.rejects(room.set('p', 'q'), /room closed/)
+  await assert.rejects(room.set('', 'x'), (e) => e instanceof VolsError && e.code === 5)
+  await assert.rejects(room.set('k'.repeat(65), 'x'), (e) => e instanceof VolsError && e.code === 10)
+  await assert.rejects(room.set('k', new Uint8Array(8193)), (e) => e instanceof VolsError && e.code === 10)
+})
+
+test('a reconnect swaps in the server state, reports differences and sends queued writes', async () => {
+  const [room, s] = await withState(async () => grant)
+  const events: string[] = []
+  room.on('state', (k, e, p) => events.push(`${p} ${k} ${text(e)}`))
+  room.on('host', (p) => events.push(`host ${p}`))
+  room.on('left', (p) => events.push(`left ${p}`))
+  s.serve(0, g('s left'))
+  s.close()
+  await until(() => FakeSocket.sockets.length === 2)
+  const queued = room.set('flag', null, { expect: 1234567890123 })
+  await until(() => FakeSocket.sockets[1].sent.length === 1)
+  const s2 = FakeSocket.sockets[1]
+  s2.serve(0, withHost(3))
+  await tick()
+  assert.deepEqual(events, ['left 2', '0 phase undefined', '3 ready undefined', 'host 3'])
+  assert.equal(room.host, 3)
+  assert.equal(hex(s2.sent[1]), lane0(g('c set_delete')))
+  s2.serve(0, g('s refused'))
+  await assert.rejects(queued, (e) => e instanceof VolsError && e.code === 8)
+  const left = room.leave()
+  await tick()
+  s2.serve(0, byeLeft)
+  s2.close()
+  assert.deepEqual(await left, { reason: reason.left })
 })

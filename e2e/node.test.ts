@@ -145,3 +145,61 @@ test('reconnect ends on a refusal or when the grant function throws', async () =
   await e.control.closeRoom('gone')
   assert.deepEqual(await closed, [[{ code: code.noRoom, message: 'no such room' }], [{ message: '404 no_room: no such room' }]])
 })
+
+test('shared state, host handover and backend controls', async () => {
+  await e.control.createRoom({ game: 'g', room: 'state', max_players: 3 })
+  const [WS, sockets] = tracked()
+  const a = await connect(() => grant('state', 'alice'), { WebSocket: WS })
+  assert.equal(a.host, 1)
+  const phase = await a.set('phase', 'lobby', { expect: 0 })
+  assert.equal(phase?.rev, 1)
+  await a.set('ready', 'yes', { mine: true })
+  assert.deepEqual(await e.control.setState('state', { key: 'seed', value: '42' }), { scope: 0, key: 'seed', rev: 3 })
+
+  const b = await connect(await grant('state', 'bob'))
+  assert.equal(b.host, 1)
+  assert.equal(text(b.state().get('phase')!.value), 'lobby')
+  assert.equal(text(b.state(1).get('ready')!.value), 'yes')
+  assert.equal(b.state().get('seed')!.by, 0)
+  await assert.rejects(b.set('seed', 'x'), (x) => x instanceof VolsError && x.code === code.forbidden)
+  await assert.rejects(b.set('phase', 'play', { expect: 0 }), (x) => x instanceof VolsError && x.code === code.conflict)
+  const seen = once(a, 'state')
+  assert.equal((await b.set('phase', 'play', { expect: phase!.rev }))?.rev, 4)
+  const [key, entry, scope] = await seen
+  assert.deepEqual([key, entry && text(entry.value), entry?.by, scope], ['phase', 'play', 2, 0])
+
+  const view = await e.control.players('state')
+  assert.equal(view.host, 1)
+  assert.deepEqual(
+    view.players.map((p) => [p.id, p.player, p.connected]),
+    [
+      [1, 'alice', true],
+      [2, 'bob', true],
+    ],
+  )
+  const st = await e.control.state('state')
+  assert.equal(st.rev, 4)
+  assert.equal(text(st.entries.find((x) => x.key === 'phase')!.value), 'play')
+  await assert.rejects(e.control.setState('state', { key: 'phase', value: null, expect: 1 }), (x) => x instanceof ControlError && x.status === 409)
+
+  const moved = once(b, 'host')
+  const back = once(a, 'reconnected')
+  sockets[0].close()
+  assert.deepEqual(await moved, [2])
+  await back
+  assert.equal(a.host, 2)
+  assert.equal(text(a.state().get('phase')!.value), 'play')
+
+  await e.control.lock('state')
+  await assert.rejects(connect(await grant('state', 'carol')), (x) => x instanceof VolsError && x.code === code.locked)
+  const kicked = once(a, 'close')
+  const gone = once(b, 'left')
+  await e.control.kick('state', 'alice')
+  assert.deepEqual(await kicked, [{ reason: reason.kicked }])
+  assert.deepEqual(await gone, [1, reason.kicked])
+  assert.equal(b.state(1).size, 0)
+  assert.equal((await e.control.lock('state', false)).locked, false)
+  await assert.rejects(connect(await grant('state', 'alice')), (x) => x instanceof VolsError && x.code === code.forbidden)
+  await assert.rejects(e.control.kick('state', 'alice'), (x) => x instanceof ControlError && x.error === 'no_player')
+  await b.leave()
+})

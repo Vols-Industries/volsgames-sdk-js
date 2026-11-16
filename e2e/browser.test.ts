@@ -31,15 +31,16 @@ test('chrome over webtransport relays both lanes to a websocket peer, and falls 
   try {
     await page.goto(`http://127.0.0.1:${(site.address() as AddressInfo).port}/`)
     await e.control.createRoom({ game: 'g', room: 'web' })
-    const kind = await page.evaluate(async (grant: Grant) => {
+    await e.control.setState('web', { key: 'map', value: 'arena-1' })
+    const joined = await page.evaluate(async (grant: Grant) => {
       const sdk: Sdk = await import(String('/dist/index.js'))
       const w = window as unknown as Page
       w.got = []
       w.room = await sdk.connect(grant, { transport: 'webtransport' })
       w.room.on('data', (from, p) => w.got.push([from, new TextDecoder().decode(p)]))
-      return w.room.transport
+      return [w.room.transport, new TextDecoder().decode(w.room.state().get('map')?.value), w.room.host]
     }, await e.control.token('web', { player: 'chrome' }))
-    assert.equal(kind, 'webtransport')
+    assert.deepEqual(joined, ['webtransport', 'arena-1', 1])
 
     const peer = await connect(await e.control.token('web', { player: 'node' }))
     const fast = once(peer, 'data')
@@ -50,6 +51,10 @@ test('chrome over webtransport relays both lanes to a websocket peer, and falls 
     const sure = once(peer, 'data')
     await page.evaluate(() => (window as unknown as Page).room.send('stream from chrome'))
     assert.equal(text((await sure)[1]), 'stream from chrome')
+    const scored = once(peer, 'state')
+    assert.equal(await page.evaluate(async () => (await (window as unknown as Page).room.set('score', '3'))?.rev), 2)
+    const [key, entry, scope] = await scored
+    assert.deepEqual([key, entry && text(entry.value), scope], ['score', '3', 0])
 
     peer.send('stream to chrome')
     peer.send('datagram to chrome', { reliable: false })
