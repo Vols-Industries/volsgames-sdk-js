@@ -1,10 +1,22 @@
 # volsgames-sdk-js
 
-Client SDK for browsers and Node. Transport: WebTransport over QUIC, WebSocket fallback.
+Client SDK for VolsGames: WebTransport with WebSocket fallback, rooms, relay, reconnect.
+Browsers and Node 22+, no runtime dependencies.
 
-Part of **VolsGames**, the real-time gaming network engine by Vols Industries.
-Design docs live in the core repo: https://github.com/Vols-Industries/volsgames/tree/main/docs
+```
+npm install github:Vols-Industries/volsgames-sdk-js
+```
 
-Status: design phase, no code yet.
+```js
+import { connect } from '@volsgames/sdk'
+
+const room = await connect(await fetch('/join').then((r) => r.json()))
+room.on('data', (from, payload) => {})
+room.send('hello', { to: 'others', reliable: false })
+```
+
+Tests: `npm test`; `npm run e2e` runs against `../volsgames/target/debug/volsgames` or `VOLSGAMES_BIN`.
+
+Documentation: https://volsgames.com/docs#sdk
 
 Licence: Apache-2.0, see LICENSE.
